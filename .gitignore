@@ -1,0 +1,20 @@
+# DuckDB database (1.4 GB, rebuilt from CSVs via db.py)
+*.duckdb
+*.duckdb.wal
+
+# MovieLens raw data (too large for GitHub)
+data/ml-32m/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Editor / tooling
+.claude/
+.vscode/
+.idea/
+.DS_Store
