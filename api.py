@@ -1,13 +1,19 @@
 from fastapi import FastAPI, Query, HTTPException
+from fastapi.responses import HTMLResponse
 from db import init_db, get_connection
+import time
 
 app = FastAPI(title="MovieLens 32M Analysis API", version="1.0")
 
 
 @app.on_event("startup")
 def startup():
-    init_db()
+
+    init_db() 
+
     app.state.db = get_connection(read_only=True)
+    
+    app.state.db.execute("SELECT count(*) FROM ratings").fetchone()
 
 
 @app.on_event("shutdown")
@@ -16,15 +22,266 @@ def shutdown():
 
 
 def query(sql: str, params: list | None = None):
-    """Execute a read query and return list of dicts."""
+    """Execute a read query and return {'metadata': {...}, 'data': [...]}.
+
+    The wrapper attaches per-call timing + row count so the UI / demo
+    script can show backend latency without re-running the query.
+    """
+    start_time = time.perf_counter()
     result = app.state.db.execute(sql, params or []).fetchall()
     columns = [desc[0] for desc in app.state.db.description]
-    return [dict(zip(columns, row)) for row in result]
+    duration_ms = (time.perf_counter() - start_time) * 1000
+    return {
+        "metadata": {
+            "duration_ms": round(duration_ms, 2),
+            "row_count": len(result),
+        },
+        "data": [dict(zip(columns, row)) for row in result],
+    }
+
+
+# SQL snippets reused by /explain so the plan reflects the same SQL the
+# operation endpoints actually run.
+EXPLAIN_QUERIES: dict[str, str] = {
+    "o1_by_genre": """
+        SELECT mg.genre, count(*) AS rating_count, avg(r.rating) AS avg_rating
+        FROM ratings r
+        JOIN movie_genres mg ON r.movieId = mg.movieId
+        GROUP BY mg.genre
+        ORDER BY rating_count DESC
+    """,
+    "o2_filter_movies": """
+        SELECT m.movieId, m.title, avg(r.rating) AS avg_rating, count(*) AS rating_count
+        FROM ratings r
+        JOIN movies m ON r.movieId = m.movieId
+        WHERE regexp_extract(m.title, '\\((\\d{4})\\)', 1) != ''
+        GROUP BY m.movieId, m.title
+        HAVING count(*) >= 50 AND avg(r.rating) >= 4.0
+        ORDER BY avg(r.rating) DESC
+        LIMIT 50
+    """,
+    "o3_top_movies_weighted": """
+        WITH movie_stats AS (
+            SELECT m.movieId, m.title, count(*) AS rating_count, avg(r.rating) AS avg_rating
+            FROM ratings r JOIN movies m ON r.movieId = m.movieId
+            GROUP BY m.movieId, m.title
+            HAVING count(*) >= 50
+        ),
+        g AS (SELECT avg(avg_rating) AS global_avg FROM movie_stats)
+        SELECT ms.*, (ms.rating_count*1.0/(ms.rating_count+50))*ms.avg_rating
+             + (50*1.0/(ms.rating_count+50))*g.global_avg AS weighted_score
+        FROM movie_stats ms, g
+        ORDER BY weighted_score DESC
+        LIMIT 20
+    """,
+    "o4_decade_trends": """
+        SELECT
+            (cast(regexp_extract(m.title, '\\((\\d{4})\\)', 1) AS INTEGER) / 10) * 10 AS decade,
+            count(*) AS rating_count, avg(r.rating) AS avg_rating
+        FROM ratings r
+        JOIN movies m ON r.movieId = m.movieId
+        WHERE regexp_extract(m.title, '\\((\\d{4})\\)', 1) != ''
+        GROUP BY decade
+        ORDER BY decade
+    """,
+}
+
+
+@app.get("/explain")
+def explain(
+    op: str = Query(..., description=f"Preset op name. One of: {sorted(EXPLAIN_QUERIES)}"),
+    analyze: bool = Query(True, description="Use EXPLAIN ANALYZE (runs the query)"),
+):
+    """Return DuckDB's physical plan (and optionally timings) for a preset
+    query. Demonstrates columnar scan + vectorized execution operators.
+    """
+    if op not in EXPLAIN_QUERIES:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown op '{op}'. Available: {sorted(EXPLAIN_QUERIES)}",
+        )
+    sql = EXPLAIN_QUERIES[op].strip()
+    prefix = "EXPLAIN ANALYZE" if analyze else "EXPLAIN"
+    start = time.perf_counter()
+    rows = app.state.db.execute(f"{prefix} {sql}").fetchall()
+    duration_ms = round((time.perf_counter() - start) * 1000, 2)
+    # DuckDB returns rows like (explain_key, explain_value)
+    plan_text = "\n\n".join(
+        f"[{r[0]}]\n{r[1]}" if len(r) >= 2 else str(r[0]) for r in rows
+    )
+    return {
+        "op": op,
+        "analyze": analyze,
+        "sql": sql,
+        "duration_ms": duration_ms,
+        "plan": plan_text,
+    }
 
 
 # ---------------------------------------------------------------------------
 # Utility endpoints
 # ---------------------------------------------------------------------------
+
+@app.get("/ui", response_class=HTMLResponse)
+def ui():
+    """Minimal HTML dashboard for demoing the operations in demo.py."""
+    return """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>MovieLens 32M — Demo UI</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 1100px; margin: 24px auto; padding: 0 16px; color: #222; }
+  h1 { margin-bottom: 4px; }
+  .sub { color: #666; margin-bottom: 20px; }
+  .card { border: 1px solid #e3e3e3; border-radius: 8px; padding: 16px; margin: 14px 0; }
+  .card h3 { margin: 0 0 8px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 8px 0; }
+  button { padding: 8px 14px; background: #1f6feb; color: #fff; border: 0; border-radius: 6px; cursor: pointer; }
+  button:hover { background: #155ab6; }
+  input, select { padding: 6px 8px; border: 1px solid #ccc; border-radius: 6px; }
+  .meta { font-family: ui-monospace, Menlo, monospace; color: #333; background: #f5f7fa; padding: 8px; border-radius: 6px; margin-top: 8px; font-size: 13px; }
+  table { border-collapse: collapse; width: 100%; margin-top: 8px; font-size: 14px; }
+  th, td { border: 1px solid #e3e3e3; padding: 6px 10px; text-align: left; }
+  th { background: #fafafa; }
+  .err { color: #b00020; font-family: ui-monospace, Menlo, monospace; }
+</style>
+</head>
+<body>
+<h1>MovieLens 32M — Demo UI</h1>
+<div class="sub">Sub-second queries over 32M ratings via DuckDB + FastAPI.</div>
+
+<div class="card">
+  <h3>O3 — Top Movies (weighted ranking)</h3>
+  <div class="row">
+    k: <input id="o3_k" type="number" value="20" min="1" max="200" style="width:70px">
+    genre: <input id="o3_genre" placeholder="(optional, e.g. Sci-Fi)" style="width:220px">
+    metric:
+    <select id="o3_metric">
+      <option value="weighted">weighted</option>
+      <option value="popularity">popularity</option>
+      <option value="avg_rating">avg_rating</option>
+    </select>
+    <button onclick="runO3()">Run</button>
+  </div>
+  <div id="o3_out"></div>
+</div>
+
+<div class="card">
+  <h3>O4 — Genre Over Time</h3>
+  <div class="row">
+    genre: <input id="o4g_genre" value="Sci-Fi" style="width:220px">
+    <button onclick="runO4Genre()">Run</button>
+  </div>
+  <div id="o4g_out"></div>
+</div>
+
+<div class="card">
+  <h3>O4 — Decade Trends (all genres)</h3>
+  <div class="row">
+    <button onclick="runO4Decade()">Run</button>
+  </div>
+  <div id="o4d_out"></div>
+</div>
+
+<div class="card">
+  <h3>O1 — Aggregate by Genre</h3>
+  <div class="row">
+    <button onclick="runO1()">Run</button>
+  </div>
+  <div id="o1_out"></div>
+</div>
+
+<div class="card">
+  <h3>EXPLAIN ANALYZE — DuckDB Physical Plan</h3>
+  <div class="sub">Shows columnar scan + vectorized operators for any preset op.</div>
+  <div class="row">
+    op:
+    <select id="ex_op">
+      <option value="o1_by_genre">o1_by_genre</option>
+      <option value="o2_filter_movies">o2_filter_movies</option>
+      <option value="o3_top_movies_weighted">o3_top_movies_weighted</option>
+      <option value="o4_decade_trends">o4_decade_trends</option>
+    </select>
+    <label><input id="ex_analyze" type="checkbox" checked> run (EXPLAIN ANALYZE)</label>
+    <button onclick="runExplain()">Explain</button>
+  </div>
+  <div id="ex_out"></div>
+</div>
+
+<script>
+async function runQuery(url, outId) {
+  const out = document.getElementById(outId);
+  out.innerHTML = "Running…";
+  const t0 = performance.now();
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const json = await res.json();
+    const payload = json.data || {};
+    const meta = payload.metadata || {};
+    const rows = payload.data || [];
+    const clientMs = (performance.now() - t0).toFixed(1);
+    const metaHtml = `<div class="meta">`
+      + `backend: ${meta.duration_ms ?? "?"} ms &nbsp;|&nbsp; `
+      + `round-trip: ${clientMs} ms &nbsp;|&nbsp; `
+      + `rows: ${meta.row_count ?? rows.length} &nbsp;|&nbsp; `
+      + `url: ${url}`
+      + `</div>`;
+    out.innerHTML = metaHtml + renderTable(rows.slice(0, 25))
+      + (rows.length > 25 ? `<div class="meta">Showing first 25 of ${rows.length} rows.</div>` : "");
+  } catch (e) {
+    out.innerHTML = `<div class="err">Error: ${e.message}</div>`;
+  }
+}
+function renderTable(rows) {
+  if (!rows.length) return "<div class='meta'>No rows.</div>";
+  const cols = Object.keys(rows[0]);
+  let h = "<table><thead><tr>" + cols.map(c => `<th>${c}</th>`).join("") + "</tr></thead><tbody>";
+  for (const r of rows) {
+    h += "<tr>" + cols.map(c => `<td>${r[c] ?? ""}</td>`).join("") + "</tr>";
+  }
+  return h + "</tbody></table>";
+}
+function runO3() {
+  const k = document.getElementById("o3_k").value || 20;
+  const genre = document.getElementById("o3_genre").value.trim();
+  const metric = document.getElementById("o3_metric").value;
+  let url = `/o3/top-movies?k=${k}&metric=${encodeURIComponent(metric)}`;
+  if (genre) url += `&genre=${encodeURIComponent(genre)}`;
+  runQuery(url, "o3_out");
+}
+function runO4Genre() {
+  const g = document.getElementById("o4g_genre").value.trim() || "Sci-Fi";
+  runQuery(`/o4/genre-over-time?genre=${encodeURIComponent(g)}`, "o4g_out");
+}
+function runO4Decade() { runQuery("/o4/decade-trends", "o4d_out"); }
+function runO1() { runQuery("/o1/by-genre", "o1_out"); }
+
+async function runExplain() {
+  const out = document.getElementById("ex_out");
+  const op = document.getElementById("ex_op").value;
+  const analyze = document.getElementById("ex_analyze").checked;
+  out.innerHTML = "Running EXPLAIN…";
+  try {
+    const res = await fetch(`/explain?op=${op}&analyze=${analyze}`);
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const j = await res.json();
+    const meta = `<div class="meta">op: ${j.op} &nbsp;|&nbsp; analyze: ${j.analyze} &nbsp;|&nbsp; backend: ${j.duration_ms} ms</div>`;
+    const sqlBox = `<div class="meta" style="white-space:pre-wrap">${escapeHtml(j.sql)}</div>`;
+    const planBox = `<pre class="meta" style="white-space:pre-wrap; max-height:420px; overflow:auto">${escapeHtml(j.plan)}</pre>`;
+    out.innerHTML = meta + "<b>SQL</b>" + sqlBox + "<b>Physical plan</b>" + planBox;
+  } catch (e) {
+    out.innerHTML = `<div class="err">Error: ${e.message}</div>`;
+  }
+}
+function escapeHtml(s) {
+  return String(s).replace(/[&<>\"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]));
+}
+</script>
+</body>
+</html>"""
+
 
 @app.get("/")
 def root():
@@ -39,27 +296,29 @@ def root():
 @app.get("/movies/search")
 def search_movies(q: str = Query(..., description="Search keyword"), limit: int = 20):
     """Search movies by title."""
-    rows = query(
+    return query(
         "SELECT movieId, title, genres FROM movies WHERE title ILIKE '%' || $1 || '%' LIMIT $2",
         [q, limit],
     )
-    return rows
 
 
 @app.get("/movies/{movie_id}")
 def get_movie(movie_id: int):
     """Single movie detail with aggregate stats."""
-    movie = query("SELECT movieId, title, genres FROM movies WHERE movieId = $1", [movie_id])
-    if not movie:
+    movie_rows = query(
+        "SELECT movieId, title, genres FROM movies WHERE movieId = $1",
+        [movie_id],
+    )["data"]
+    if not movie_rows:
         raise HTTPException(status_code=404, detail="Movie not found")
 
-    stats = query(
+    stats_rows = query(
         """
         SELECT count(*) AS num_ratings, round(avg(rating), 2) AS avg_rating
         FROM ratings WHERE movieId = $1
         """,
         [movie_id],
-    )
+    )["data"]
     top_tags = query(
         """
         SELECT tag, count(*) AS cnt
@@ -67,8 +326,8 @@ def get_movie(movie_id: int):
         GROUP BY tag ORDER BY cnt DESC LIMIT 10
         """,
         [movie_id],
-    )
-    return {**movie[0], **stats[0], "top_tags": top_tags}
+    )["data"]
+    return {**movie_rows[0], **stats_rows[0], "top_tags": top_tags}
 
 
 # ===========================================================================
@@ -493,3 +752,4 @@ def o4_yearly_genre_share(
         "operation": "O4 — Yearly Genre Share",
         "data": rows,
     }
+
