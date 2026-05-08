@@ -7,65 +7,318 @@ application operations required by the course project.
 
 ---
 
-## 1. Quick Start
+## Table of Contents
 
-### 1.1 Install dependencies
+1. [Prerequisites](#1-prerequisites)
+2. [Setup & Installation](#2-setup--installation)
+3. [Dataset Instructions](#3-dataset-instructions)
+4. [Configuration](#4-configuration)
+5. [Secret Keys / Credentials](#5-secret-keys--credentials)
+6. [Running the Application](#6-running-the-application)
+7. [Reproducing the Results](#7-reproducing-the-results)
+8. [Troubleshooting](#8-troubleshooting)
+9. [Application Operations (Reference)](#9-application-operations-reference)
+10. [Mapping: Application Behavior ↔ DuckDB Internals](#10-mapping-application-behavior--duckdb-internals)
+11. [DuckDB Internal Architecture (focus areas)](#11-duckdb-internal-architecture-focus-areas)
+12. [Comparison with MySQL and MongoDB](#12-comparison-with-mysql-and-mongodb)
+13. [Files](#13-files)
+
+---
+
+## 1. Prerequisites
+
+| Requirement     | Minimum                                                                  |
+| --------------- | ------------------------------------------------------------------------ |
+| Operating sys.  | macOS, Linux, or Windows 10+ (tested on macOS 14 + Ubuntu 22.04)         |
+| Python          | **3.9 or newer** (3.10 / 3.11 / 3.12 all work — `python3 --version`)     |
+| pip             | 22+ (`pip --version`)                                                    |
+| Free disk space | **~5 GB** (raw CSVs ~1.0 GB, Parquet ~0.5 GB, DuckDB binary ~1.4 GB)     |
+| RAM             | 4 GB is enough; 8 GB recommended for smooth `EXPLAIN ANALYZE` runs       |
+| Internet        | Required once, to download the MovieLens dataset (~265 MB zip)           |
+
+No GPU, no Docker, no cloud account, and **no API keys** are required
+(see [§5](#5-secret-keys--credentials)).
+
+---
+
+## 2. Setup & Installation
+
+### 2.1 Clone the repository
 
 ```bash
+git clone <this-repo-url>
+cd Project
+```
+
+> The repository contains the source code (`api.py`, `db.py`, `demo.py`)
+> and `requirements.txt`. The 1.4 GB DuckDB binary and the raw CSVs are
+> **not** committed (see `.gitignore`); they are rebuilt locally by the
+> commands below.
+
+### 2.2 Create an isolated Python environment (recommended)
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate          # macOS / Linux
+# or, on Windows:
+# .venv\Scripts\activate
+```
+
+### 2.3 Install Python dependencies
+
+```bash
+pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### 1.2 Download the dataset
-
-The raw CSVs are too large to commit. Download `ml-32m.zip` from
-[grouplens.org/datasets/movielens](https://grouplens.org/datasets/movielens/)
-and extract into:
+`requirements.txt` pins the following libraries:
 
 ```
-data/ml-32m/
-  ├── movies.csv
-  ├── ratings.csv
-  ├── tags.csv
-  └── links.csv
+duckdb>=1.1.0
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+requests>=2.31.0
+tabulate>=0.9.0
 ```
 
-### 1.3 Build the DuckDB database (one-time, ~1.4 GB)
+Verify the installation:
+
+```bash
+python -c "import duckdb, fastapi, uvicorn, requests, tabulate; print('OK')"
+```
+
+You should see `OK` printed.
+
+---
+
+## 3. Dataset Instructions
+
+This project uses the **MovieLens 32M** dataset, which is ~265 MB
+compressed (~1.0 GB extracted). It is **too large to commit to GitHub**,
+so you must download it once from the official source.
+
+### 3.1 Download
+
+Download `ml-32m.zip` from the official GroupLens page:
+
+- **Page**: [https://grouplens.org/datasets/movielens/](https://grouplens.org/datasets/movielens/)
+- **Direct link**: [https://files.grouplens.org/datasets/movielens/ml-32m.zip](https://files.grouplens.org/datasets/movielens/ml-32m.zip)
+
+> The dataset is freely redistributable for non-commercial / research use
+> per the [MovieLens README license](https://files.grouplens.org/datasets/movielens/ml-32m-README.html).
+
+### 3.2 Extract into the expected location
+
+Unzip into the `data/` folder of this repository so the layout is exactly:
+
+```
+Project/
+  data/
+    ml-32m/
+      ├── movies.csv          (~3   MB)
+      ├── ratings.csv         (~870 MB, 32M rows)
+      ├── tags.csv            (~38  MB)
+      ├── links.csv           (~1.5 MB)
+      └── README.txt          (dataset info)
+```
+
+One-liner (macOS / Linux, run from the project root):
+
+```bash
+mkdir -p data
+curl -L -o /tmp/ml-32m.zip https://files.grouplens.org/datasets/movielens/ml-32m.zip
+unzip /tmp/ml-32m.zip -d data/
+```
+
+Verify the four CSVs are present:
+
+```bash
+ls -lh data/ml-32m/*.csv
+```
+
+### 3.3 Build the DuckDB database (one-time, ~1–3 minutes)
 
 ```bash
 python db.py
 ```
 
-On first run this converts the CSVs to Parquet (columnar, typed), then
-loads them into `movielens.duckdb`. Subsequent runs attach the existing
-binary instantly.
+This script will:
 
-### 1.4 Run the API
+1. Read each CSV with DuckDB's `read_csv_auto`.
+2. Persist them as columnar **Parquet** files in `data/parquet/`.
+3. Load the Parquet files into a single persistent **DuckDB** binary
+   `movielens.duckdb` (~1.4 GB) at the project root.
+4. Build a `movie_genres` lookup table by exploding the pipe-separated
+   `genres` column.
+
+Expected output ends with:
+
+```
+🎉 DATABASE INITIALIZATION COMPLETE!
+⏱️  Total Processing Time: <NN.NN> seconds
+💾 Optimized DB File: .../Project/movielens.duckdb
+```
+
+If the database file already exists, re-running `python db.py` will
+detect it and exit immediately (warm start).
+
+> **No external dataset upload is required from the grader** — the four
+> CSV files in `data/ml-32m/` are the input, and `python db.py`
+> deterministically produces the same DuckDB binary every time.
+
+---
+
+## 4. Configuration
+
+There is **no configuration file to edit**. All paths are derived
+relative to the project root by `db.py`:
+
+| Path constant   | Default value                  | Purpose                                |
+| --------------- | ------------------------------ | -------------------------------------- |
+| `DB_PATH`       | `./movielens.duckdb`           | Persistent DuckDB binary               |
+| `DATA_DIR`      | `./data/ml-32m/`               | Source CSVs (you populate in §3.2)     |
+| `PARQUET_DIR`   | `./data/parquet/`              | Intermediate Parquet (auto-generated)  |
+
+If you want to relocate the database (e.g. to an external SSD), edit the
+constants at the top of [db.py](db.py) and the matching `DB_PATH` near
+the top of [api.py](api.py). For graders, the defaults are correct and
+no changes are needed.
+
+The API server's host and port are passed on the `uvicorn` command line
+(see §6). Default is `127.0.0.1:8000`.
+
+---
+
+## 5. Secret Keys / Credentials
+
+**This project does NOT require any API keys, secret tokens,
+credentials, or environment variables.**
+
+- No third-party APIs are called at runtime.
+- No `.env` file is read.
+- No cloud services (AWS / GCP / Azure / OpenAI / Anthropic / etc.) are
+  used.
+- The MovieLens dataset is publicly downloadable without registration.
+- DuckDB is an embedded, in-process database — there is no server, no
+  user, no password.
+
+If you find any reference to credentials in the code, it is a bug —
+please report it. Nothing in this repository requires the grader to
+contact us by email for keys.
+
+---
+
+## 6. Running the Application
+
+After completing §2 and §3, the application runs in two parts.
+
+### 6.1 Start the API server
+
+From the project root:
 
 ```bash
 uvicorn api:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-- Interactive API docs: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
-- Demo dashboard UI:    [http://127.0.0.1:8000/ui](http://127.0.0.1:8000/ui)
+The first time it starts, DuckDB will memory-map the 1.4 GB binary
+(takes a couple of seconds). When you see `Application startup complete.`
+the service is ready.
 
-### 1.5 Run the CLI demo
+Open these URLs in any browser:
 
-In a second terminal:
+- **Interactive Swagger / OpenAPI docs**: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
+- **Demo dashboard UI**: [http://127.0.0.1:8000/ui](http://127.0.0.1:8000/ui)
+- **Dataset summary (root)**: [http://127.0.0.1:8000/](http://127.0.0.1:8000/)
+
+You can also `curl` any endpoint, e.g.:
+
+```bash
+curl 'http://127.0.0.1:8000/o1/by-genre' | python -m json.tool | head -40
+```
+
+### 6.2 Run the CLI demo (in a second terminal)
+
+With the API still running in the first terminal, open a second terminal
+in the same project directory (re-activate the venv if you used one) and
+run:
 
 ```bash
 python demo.py
 ```
 
-This exercises all four operations (O1–O4), prints timings + tables, and
-fetches `EXPLAIN ANALYZE` plans so you can see DuckDB's physical
-operators.
+This walks through all four operations (O1–O4), prints timings and
+result tables, and fetches `EXPLAIN ANALYZE` plans so you can see
+DuckDB's physical operators (`TABLE_SCAN`, `HASH_JOIN`, `HASH_GROUP_BY`,
+`TOP_N`, …).
 
 ---
 
-## 2. Application Operations
+## 7. Reproducing the Results
+
+The full reproduction pipeline, from a fresh clone, is exactly:
+
+```bash
+# 1. Get the code
+git clone <this-repo-url>
+cd Project
+
+# 2. Python env + dependencies
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+# 3. Get the dataset (one-time, ~265 MB download)
+mkdir -p data
+curl -L -o /tmp/ml-32m.zip https://files.grouplens.org/datasets/movielens/ml-32m.zip
+unzip /tmp/ml-32m.zip -d data/
+
+# 4. Build the DuckDB binary (one-time, ~1–3 min)
+python db.py
+
+# 5. Launch the API server
+uvicorn api:app --host 127.0.0.1 --port 8000 --reload
+```
+
+Then, in a **separate terminal**, with `.venv` activated:
+
+```bash
+python demo.py
+```
+
+`demo.py` is the canonical reproduction script. A successful run will:
+
+- Print a header for each of O1–O4.
+- Show a tabulated result for each query.
+- Report `duration_ms` for each backend call (typical numbers on a 2023
+  laptop: O1 ≈ 700–900 ms cold / 200–400 ms warm, O2 ≈ 200–500 ms,
+  O3 ≈ 800–1200 ms, O4 ≈ 600–900 ms — your numbers will differ but the
+  *operator pipeline* should match).
+- Print `EXPLAIN ANALYZE` plans showing the physical operators
+  referenced in [§10](#10-mapping-application-behavior--duckdb-internals).
+
+You can also reproduce visually by opening `http://127.0.0.1:8000/ui`
+and clicking each of the O1 / O2 / O3 / O4 buttons.
+
+---
+
+## 8. Troubleshooting
+
+| Symptom                                                            | Cause / Fix                                                                                                            |
+| ------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------- |
+| `ModuleNotFoundError: No module named 'duckdb'`                    | The venv is not activated, or `pip install -r requirements.txt` was skipped. Re-activate and reinstall.                |
+| `IO Error: No files found that match the pattern ".../movies.csv"` | Step §3.2 was skipped. Make sure all four CSVs are inside `data/ml-32m/`.                                              |
+| `db.py` looks stuck on `ratings`                                   | This is normal — `ratings.csv` is 32 M rows / ~870 MB and takes 30–90 s to parse on first run. Wait it out.            |
+| Port 8000 already in use                                           | Another process owns it. Either stop that process, or run on a different port: `uvicorn api:app --port 8001`.          |
+| `demo.py` says `Connection refused`                                | The API server (step §6.1) is not running, or is on a non-default port. Start it first, or edit `BASE_URL` in demo.py. |
+| Database file missing after deleting `movielens.duckdb`            | Just re-run `python db.py` — it rebuilds from the Parquet files (or from the CSVs if Parquet is also missing).         |
+
+---
+
+## 9. Application Operations (Reference)
 
 Four operation categories are implemented. Each one is paired with a
-short mapping note explaining the DuckDB internal behavior it relies on.
+short mapping note explaining the DuckDB internal behavior it relies on
+(see [§10](#10-mapping-application-behavior--duckdb-internals)).
 
 
 | #   | Op                    | Endpoint                                                                                      | What it does                                                                       |
@@ -107,7 +360,7 @@ network). The UI and `demo.py` consume this field directly.
 
 ---
 
-## 3. Mapping: Application Behavior ↔ DuckDB Internals
+## 10. Mapping: Application Behavior ↔ DuckDB Internals
 
 This is the core of the project. For each operation we state **what the
 app does**, **what DuckDB does internally**, and **why that internal
@@ -245,7 +498,7 @@ what time-series analytics needs.
 
 ---
 
-## 4. DuckDB Internal Architecture (focus areas)
+## 11. DuckDB Internal Architecture (focus areas)
 
 The project focuses on three internal focus areas:
 
@@ -287,7 +540,7 @@ The project focuses on three internal focus areas:
 
 ---
 
-## 5. Comparison with MySQL and MongoDB
+## 12. Comparison with MySQL and MongoDB
 
 
 | Dimension                 | **DuckDB (this project)**                        | **MySQL (InnoDB)**                        | **MongoDB**                                      |
@@ -310,32 +563,12 @@ vectorized design *is* the optimization.
 
 ---
 
-## 6. Demo Walkthrough (for live presentation)
+## 13. Files
 
-Recommended 5–10 min script:
-
-1. **Show the UI** — open `http://127.0.0.1:8000/ui`, run O1 by
-   genre twice. First call is slower (cold cache, ~700–900 ms on
-   32M rows); the second hits the OS page cache and is noticeably
-   faster — a good moment to explain columnar scan vs. cache.
-2. **Run `/explain?op=o1_by_genre`** — show the physical plan. The
-   actual operators you'll see are `TABLE_SCAN`, `HASH_JOIN`,
-   `HASH_GROUP_BY`, `PROJECTION`, `ORDER_BY`. This is the concrete
-   evidence for the columnar + vectorized claim.
-3. **Run `demo.py`** in a second terminal — walks through all four
-  operations + EXPLAIN with mapping notes printed alongside.
-4. **Wrap up with the comparison table** — why MySQL/MongoDB would
-  not serve this workload as efficiently.
-
----
-
-## 7. Files
-
-- `api.py` — FastAPI app, O1–O4 endpoints, `/ui`, `/explain`
-- `db.py` — DuckDB initialization (CSV → Parquet → DuckDB)
-- `demo.py` — CLI demo exercising all four operations + EXPLAIN
-- `requirements.txt` — Python dependencies
-- `data/ml-32m/` — source CSVs (downloaded separately)
-- `data/parquet/` — intermediate Parquet files (generated)
-- `movielens.duckdb` — persistent DuckDB database (generated)
-
+- [api.py](api.py) — FastAPI app, O1–O4 endpoints, `/ui`, `/explain`
+- [db.py](db.py) — DuckDB initialization (CSV → Parquet → DuckDB)
+- [demo.py](demo.py) — CLI demo exercising all four operations + EXPLAIN
+- [requirements.txt](requirements.txt) — Python dependencies
+- `data/ml-32m/` — source CSVs (downloaded separately, see §3)
+- `data/parquet/` — intermediate Parquet files (generated by `db.py`)
+- `movielens.duckdb` — persistent DuckDB database (generated by `db.py`)
